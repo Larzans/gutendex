@@ -9,7 +9,7 @@ import urllib.request
 from django.conf import settings
 from django.core.mail import send_mail
 from django.core.management.base import BaseCommand, CommandError
-from django.db import transaction
+from django.db import connection, transaction
 
 from books import utils
 from books.models import *
@@ -115,6 +115,13 @@ def put_catalog_in_db(stat_cache):
             db_books, db_persons, db_bookshelves,
             db_languages, db_subjects, db_formats, db_summaries))
     log('  RDF files to scan: %d' % len(book_directories))
+
+    # Defer WAL flushes for this session — commits remain atomic but Postgres
+    # won't fsync on every commit, giving a significant write speedup.
+    # Worst case on a crash: last ~200ms of commits are lost, but the stat
+    # cache checkpoint handles recovery.
+    with connection.cursor() as cur:
+        cur.execute("SET synchronous_commit = off")
 
     # Pre-load small lookup tables (bookshelves, languages) into memory.
     # Subjects and persons use lazy caches — built during the run to avoid
@@ -336,11 +343,16 @@ def get_or_create_person(data, cache):
             return cache[gid]
         person = Person.objects.filter(gutenberg_id=gid).first()
         if person:
-            Person.objects.filter(pk=person.pk).update(
-                name=data['name'],
-                birth_year=data['birth'],
-                death_year=data['death'],
-            )
+            # Only UPDATE if something actually changed — person data is stable
+            # across catalog refreshes so this saves a query in most cases.
+            if (person.name != data['name']
+                    or person.birth_year != data['birth']
+                    or person.death_year != data['death']):
+                Person.objects.filter(pk=person.pk).update(
+                    name=data['name'],
+                    birth_year=data['birth'],
+                    death_year=data['death'],
+                )
         else:
             person = Person.objects.create(
                 gutenberg_id=gid,
