@@ -101,6 +101,11 @@ def put_catalog_in_db(stat_cache):
     book_ids.sort()
     book_directories = [str(id) for id in book_ids]
 
+    # Pre-load small lookup tables into memory to avoid per-book DB queries.
+    bookshelf_cache = {b.name: b for b in Bookshelf.objects.all()}
+    language_cache  = {l.code: l for l in Language.objects.all()}
+    subject_cache   = {s.name: s for s in Subject.objects.all()}
+
     skipped = 0
     processed = 0
     total_start = time()
@@ -163,51 +168,31 @@ def put_catalog_in_db(stat_cache):
 
             ''' Make/update the authors. '''
 
-            authors = []
-            for author in book['authors']:
-                person = get_or_create_person(author)
-                authors.append(person)
-
-            book_in_db.authors.clear()
-            for author in authors:
-                book_in_db.authors.add(author)
+            book_in_db.authors.set(
+                [get_or_create_person(a) for a in book['authors']]
+            )
 
             ''' Make/update the editors. '''
 
-            editors = []
-            for editor in book['editors']:
-                person = get_or_create_person(editor)
-                editors.append(person)
-
-            book_in_db.editors.clear()
-            for editor in editors:
-                book_in_db.editors.add(editor)
+            book_in_db.editors.set(
+                [get_or_create_person(e) for e in book['editors']]
+            )
 
             ''' Make/update the translators. '''
 
-            translators = []
-            for translator in book['translators']:
-                person = get_or_create_person(translator)
-                translators.append(person)
-
-            book_in_db.translators.clear()
-            for translator in translators:
-                book_in_db.translators.add(translator)
+            book_in_db.translators.set(
+                [get_or_create_person(t) for t in book['translators']]
+            )
 
             ''' Make/update the book shelves. '''
 
             bookshelves = []
             for shelf in book['bookshelves']:
-                shelf_in_db = Bookshelf.objects.filter(name=shelf)
-                if shelf_in_db.exists():
-                    shelf_in_db = shelf_in_db[0]
-                else:
-                    shelf_in_db = Bookshelf.objects.create(name=shelf)
-                bookshelves.append(shelf_in_db)
+                if shelf not in bookshelf_cache:
+                    bookshelf_cache[shelf] = Bookshelf.objects.create(name=shelf)
+                bookshelves.append(bookshelf_cache[shelf])
 
-            book_in_db.bookshelves.clear()
-            for bookshelf in bookshelves:
-                book_in_db.bookshelves.add(bookshelf)
+            book_in_db.bookshelves.set(bookshelves)
 
             ''' Make/update the formats. '''
 
@@ -238,31 +223,21 @@ def put_catalog_in_db(stat_cache):
 
             languages = []
             for language in book['languages']:
-                language_in_db = Language.objects.filter(code=language)
-                if language_in_db.exists():
-                    language_in_db = language_in_db[0]
-                else:
-                    language_in_db = Language.objects.create(code=language)
-                languages.append(language_in_db)
+                if language not in language_cache:
+                    language_cache[language] = Language.objects.create(code=language)
+                languages.append(language_cache[language])
 
-            book_in_db.languages.clear()
-            for language in languages:
-                book_in_db.languages.add(language)
+            book_in_db.languages.set(languages)
 
             ''' Make/update subjects. '''
 
             subjects = []
             for subject in book['subjects']:
-                subject_in_db = Subject.objects.filter(name=subject)
-                if subject_in_db.exists():
-                    subject_in_db = subject_in_db[0]
-                else:
-                    subject_in_db = Subject.objects.create(name=subject)
-                subjects.append(subject_in_db)
+                if subject not in subject_cache:
+                    subject_cache[subject] = Subject.objects.create(name=subject)
+                subjects.append(subject_cache[subject])
 
-            book_in_db.subjects.clear()
-            for subject in subjects:
-                book_in_db.subjects.add(subject)
+            book_in_db.subjects.set(subjects)
 
             ''' Make/update summaries. '''
 
