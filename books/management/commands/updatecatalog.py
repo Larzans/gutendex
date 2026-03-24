@@ -101,10 +101,28 @@ def put_catalog_in_db(stat_cache):
     book_ids.sort()
     book_directories = [str(id) for id in book_ids]
 
-    # Pre-load small lookup tables into memory to avoid per-book DB queries.
+    # DB diagnostics — logged before the loop so problems are visible up front.
+    db_books      = Book.objects.count()
+    db_persons    = Person.objects.count()
+    db_bookshelves = Bookshelf.objects.count()
+    db_languages  = Language.objects.count()
+    db_subjects   = Subject.objects.count()
+    db_formats    = Format.objects.count()
+    db_summaries  = Summary.objects.count()
+    log('  DB before run:  books=%d  persons=%d  bookshelves=%d  '
+        'languages=%d  subjects=%d  formats=%d  summaries=%d' % (
+            db_books, db_persons, db_bookshelves,
+            db_languages, db_subjects, db_formats, db_summaries))
+    log('  RDF files to scan: %d' % len(book_directories))
+
+    # Pre-load small lookup tables (bookshelves, languages) into memory.
+    # Subjects use a lazy cache — built during the run to avoid loading all
+    # 40k+ rows upfront while still avoiding repeated DB hits for common values.
     bookshelf_cache = {b.name: b for b in Bookshelf.objects.all()}
     language_cache  = {l.code: l for l in Language.objects.all()}
-    subject_cache   = {s.name: s for s in Subject.objects.all()}
+    subject_cache   = {}
+    log('  Caches loaded:  bookshelves=%d  languages=%d' % (
+        len(bookshelf_cache), len(language_cache)))
 
     skipped = 0
     processed = 0
@@ -114,12 +132,6 @@ def put_catalog_in_db(stat_cache):
     for directory in book_directories:
         id = int(directory)
 
-        if (id > 0) and (id % 500 == 0):
-            now = strftime('%H:%M:%S')
-            elapsed = time() - batch_start
-            log('    %s  [%6d]  skipped=%d  processed=%d  (%.1fs)' % (
-                now, id, skipped, processed, elapsed))
-            batch_start = time()
 
         book_path = os.path.join(
             settings.CATALOG_RDF_DIR,
@@ -138,10 +150,11 @@ def put_catalog_in_db(stat_cache):
         try:
             '''Make/update the book.'''
 
-            book_in_db = Book.objects.filter(gutenberg_id=id)
+            # Single query: .first() returns the object or None.
+            book_in_db = Book.objects.filter(gutenberg_id=id).first()
+            related_books_str = ','.join(str(i) for i in book['related_books'])
 
-            if book_in_db.exists():
-                book_in_db = book_in_db[0]
+            if book_in_db is not None:
                 book_in_db.copyright = book['copyright']
                 book_in_db.download_count = book['downloads']
                 book_in_db.media_type = book['type']
@@ -150,7 +163,7 @@ def put_catalog_in_db(stat_cache):
                 book_in_db.wikipedia_url = book['wikipedia_url']
                 book_in_db.reading_score = book['reading_score']
                 book_in_db.reading_score_value = book['reading_score_value']
-                book_in_db.related_books = ','.join(str(i) for i in book['related_books'])
+                book_in_db.related_books = related_books_str
                 book_in_db.save()
             else:
                 book_in_db = Book.objects.create(
@@ -163,26 +176,33 @@ def put_catalog_in_db(stat_cache):
                     wikipedia_url=book['wikipedia_url'],
                     reading_score=book['reading_score'],
                     reading_score_value=book['reading_score_value'],
-                    related_books=','.join(str(i) for i in book['related_books']),
+                    related_books=related_books_str,
                 )
 
             ''' Make/update the authors. '''
 
             book_in_db.authors.set(
-                [get_or_create_person(a) for a in book['authors']]
+                [get_or_create_person(a) for a in book['authors']],
+                clear=True,
             )
 
             ''' Make/update the editors. '''
 
-            book_in_db.editors.set(
-                [get_or_create_person(e) for e in book['editors']]
-            )
+            # Skip set() entirely when empty — avoids a needless DELETE query
+            # (most books have no editors or translators).
+            editors = [get_or_create_person(e) for e in book['editors']]
+            if editors:
+                book_in_db.editors.set(editors, clear=True)
+            else:
+                book_in_db.editors.clear()
 
             ''' Make/update the translators. '''
 
-            book_in_db.translators.set(
-                [get_or_create_person(t) for t in book['translators']]
-            )
+            translators = [get_or_create_person(t) for t in book['translators']]
+            if translators:
+                book_in_db.translators.set(translators, clear=True)
+            else:
+                book_in_db.translators.clear()
 
             ''' Make/update the book shelves. '''
 
@@ -192,32 +212,31 @@ def put_catalog_in_db(stat_cache):
                     bookshelf_cache[shelf] = Bookshelf.objects.create(name=shelf)
                 bookshelves.append(bookshelf_cache[shelf])
 
-            book_in_db.bookshelves.set(bookshelves)
+            book_in_db.bookshelves.set(bookshelves, clear=True)
 
             ''' Make/update the formats. '''
 
-            old_formats = Format.objects.filter(book=book_in_db)
-
-            format_ids = []
-            for format_ in book['formats']:
-                format_in_db = Format.objects.filter(
-                    book=book_in_db,
-                    mime_type=format_,
-                    url=book['formats'][format_]
-                )
-                if format_in_db.exists():
-                    format_in_db = format_in_db[0]
+            # Load all existing formats for this book in one query, key by
+            # (mime_type, url) so membership checks are O(1) in Python.
+            existing_formats = {
+                (f.mime_type, f.url): f
+                for f in Format.objects.filter(book=book_in_db)
+            }
+            keep_ids = set()
+            to_create = []
+            for mime_type, url in book['formats'].items():
+                key = (mime_type, url)
+                if key in existing_formats:
+                    keep_ids.add(existing_formats[key].id)
                 else:
-                    format_in_db = Format.objects.create(
-                        book=book_in_db,
-                        mime_type=format_,
-                        url=book['formats'][format_]
-                    )
-                format_ids.append(format_in_db.id)
+                    to_create.append(Format(book=book_in_db, mime_type=mime_type, url=url))
 
-            for old_format in old_formats:
-                if old_format.id not in format_ids:
-                    old_format.delete()
+            if to_create:
+                Format.objects.bulk_create(to_create)
+
+            stale_ids = {f.id for f in existing_formats.values()} - keep_ids
+            if stale_ids:
+                Format.objects.filter(id__in=stale_ids).delete()
 
             ''' Make/update the languages. '''
 
@@ -227,36 +246,40 @@ def put_catalog_in_db(stat_cache):
                     language_cache[language] = Language.objects.create(code=language)
                 languages.append(language_cache[language])
 
-            book_in_db.languages.set(languages)
+            book_in_db.languages.set(languages, clear=True)
 
             ''' Make/update subjects. '''
 
             subjects = []
             for subject in book['subjects']:
                 if subject not in subject_cache:
-                    subject_cache[subject] = Subject.objects.create(name=subject)
+                    subject_cache[subject], _ = Subject.objects.get_or_create(name=subject)
                 subjects.append(subject_cache[subject])
 
-            book_in_db.subjects.set(subjects)
+            book_in_db.subjects.set(subjects, clear=True)
 
             ''' Make/update summaries. '''
 
-            old_summaries = Summary.objects.filter(book=book_in_db)
+            # Same pattern as formats: load existing in one query, compare in
+            # Python, bulk_create new ones, bulk delete stale ones.
+            existing_summaries = {
+                s.text: s for s in Summary.objects.filter(book=book_in_db)
+            }
+            new_texts = set(book['summaries'])
+            to_create = [
+                Summary(book=book_in_db, text=text)
+                for text in new_texts
+                if text not in existing_summaries
+            ]
+            if to_create:
+                Summary.objects.bulk_create(to_create)
 
-            summary_ids = []
-            for summary in book['summaries']:
-                summary_in_db = Summary.objects.filter(book=book_in_db, text=summary)
-                if summary_in_db.exists():
-                    summary_in_db = summary_in_db[0]
-                else:
-                    summary_in_db = Summary.objects.create(
-                        book=book_in_db, text=summary
-                    ) 
-                summary_ids.append(summary_in_db.id)
-
-            for old_summary in old_summaries:
-                if old_summary.id not in summary_ids:
-                    old_summary.delete()
+            stale_ids = {
+                s.id for text, s in existing_summaries.items()
+                if text not in new_texts
+            }
+            if stale_ids:
+                Summary.objects.filter(id__in=stale_ids).delete()
 
         except Exception as error:
             book_json = json.dumps(book, indent=4)
@@ -271,11 +294,26 @@ def put_catalog_in_db(stat_cache):
         processed += 1
 
         if processed % 500 == 0:
+            now = strftime('%H:%M:%S')
+            elapsed = time() - batch_start
+            log('    %s  [processed=%d  id=%d]  skipped=%d  (%.1fs)' % (
+                now, processed, id, skipped, elapsed))
+            batch_start = time()
             save_stat_cache(stat_cache, quiet=True)
 
     total_elapsed = _fmt_duration(time() - total_start)
     log('    Skipped (unchanged): %d  Processed: %d  Total: %s' % (
         skipped, processed, total_elapsed))
+
+    # DB diagnostics after the run — compare with the before numbers to spot
+    # unexpected growth or missing data.
+    log('  DB after run:   books=%d  persons=%d  bookshelves=%d  '
+        'languages=%d  subjects=%d  formats=%d  summaries=%d' % (
+            Book.objects.count(), Person.objects.count(),
+            Bookshelf.objects.count(), Language.objects.count(),
+            Subject.objects.count(), Format.objects.count(),
+            Summary.objects.count()))
+
     return stat_cache, {str(id) for id in book_ids}
 
 
