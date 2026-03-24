@@ -138,9 +138,201 @@ def put_catalog_in_db(stat_cache):
     total_start = time()
     batch_start = time()
 
+    _BOOK_UPDATE_FIELDS = [
+        'copyright', 'download_count', 'media_type', 'title',
+        'published_year', 'wikipedia_url', 'reading_score',
+        'reading_score_value', 'related_books',
+    ]
+    _BATCH_SIZE = 200
+
+    # Collect books to process in batches so we can bulk-fetch existing Book
+    # rows with one SELECT per batch instead of one per book.
+    pending = []   # list of (directory, id, book_path, st)
+
+    def flush_pending():
+        nonlocal processed, batch_start
+
+        if not pending:
+            return
+
+        # One SELECT for the entire batch.
+        batch_ids = [p[1] for p in pending]
+        books_in_db = {
+            b.gutenberg_id: b
+            for b in Book.objects.filter(gutenberg_id__in=batch_ids)
+        }
+
+        for directory, id, book_path, st in pending:
+            book = utils.get_book(id, book_path)
+            book_in_db = books_in_db.get(id)
+            is_new = book_in_db is None
+
+            try:
+                with transaction.atomic():
+                    '''Make/update the book.'''
+
+                    related_books_str = ','.join(str(i) for i in book['related_books'])
+
+                    if not is_new:
+                        book_in_db.copyright = book['copyright']
+                        book_in_db.download_count = book['downloads']
+                        book_in_db.media_type = book['type']
+                        book_in_db.title = book['title']
+                        book_in_db.published_year = book['published_year']
+                        book_in_db.wikipedia_url = book['wikipedia_url']
+                        book_in_db.reading_score = book['reading_score']
+                        book_in_db.reading_score_value = book['reading_score_value']
+                        book_in_db.related_books = related_books_str
+                        book_in_db.save(update_fields=_BOOK_UPDATE_FIELDS)
+                    else:
+                        book_in_db = Book.objects.create(
+                            gutenberg_id=id,
+                            copyright=book['copyright'],
+                            download_count=book['downloads'],
+                            media_type=book['type'],
+                            title=book['title'],
+                            published_year=book['published_year'],
+                            wikipedia_url=book['wikipedia_url'],
+                            reading_score=book['reading_score'],
+                            reading_score_value=book['reading_score_value'],
+                            related_books=related_books_str,
+                        )
+
+                    ''' Make/update the authors. '''
+
+                    book_in_db.authors.set(
+                        [get_or_create_person(a, person_cache) for a in book['authors']],
+                        clear=not is_new,
+                    )
+
+                    ''' Make/update the editors. '''
+
+                    editors = [get_or_create_person(e, person_cache) for e in book['editors']]
+                    if editors:
+                        book_in_db.editors.set(editors, clear=not is_new)
+                    elif not is_new:
+                        book_in_db.editors.clear()
+
+                    ''' Make/update the translators. '''
+
+                    translators = [get_or_create_person(t, person_cache) for t in book['translators']]
+                    if translators:
+                        book_in_db.translators.set(translators, clear=not is_new)
+                    elif not is_new:
+                        book_in_db.translators.clear()
+
+                    ''' Make/update the book shelves. '''
+
+                    bookshelves = []
+                    for shelf in book['bookshelves']:
+                        if shelf not in bookshelf_cache:
+                            bookshelf_cache[shelf] = Bookshelf.objects.create(name=shelf)
+                        bookshelves.append(bookshelf_cache[shelf])
+
+                    book_in_db.bookshelves.set(bookshelves, clear=not is_new)
+
+                    ''' Make/update the formats. '''
+
+                    # New books have no existing formats — skip the SELECT and
+                    # go straight to bulk_create. For existing books, load in
+                    # one query, compare in Python, bulk create/delete.
+                    if is_new:
+                        Format.objects.bulk_create([
+                            Format(book=book_in_db, mime_type=mt, url=url)
+                            for mt, url in book['formats'].items()
+                        ])
+                    else:
+                        existing_formats = {
+                            (f.mime_type, f.url): f
+                            for f in Format.objects.filter(book=book_in_db)
+                        }
+                        keep_ids = set()
+                        to_create = []
+                        for mime_type, url in book['formats'].items():
+                            key = (mime_type, url)
+                            if key in existing_formats:
+                                keep_ids.add(existing_formats[key].id)
+                            else:
+                                to_create.append(Format(book=book_in_db, mime_type=mime_type, url=url))
+
+                        if to_create:
+                            Format.objects.bulk_create(to_create)
+
+                        stale_ids = {f.id for f in existing_formats.values()} - keep_ids
+                        if stale_ids:
+                            Format.objects.filter(id__in=stale_ids).delete()
+
+                    ''' Make/update the languages. '''
+
+                    languages = []
+                    for language in book['languages']:
+                        if language not in language_cache:
+                            language_cache[language] = Language.objects.create(code=language)
+                        languages.append(language_cache[language])
+
+                    book_in_db.languages.set(languages, clear=not is_new)
+
+                    ''' Make/update subjects. '''
+
+                    subjects = []
+                    for subject in book['subjects']:
+                        if subject not in subject_cache:
+                            subject_cache[subject], _ = Subject.objects.get_or_create(name=subject)
+                        subjects.append(subject_cache[subject])
+
+                    book_in_db.subjects.set(subjects, clear=not is_new)
+
+                    ''' Make/update summaries. '''
+
+                    if is_new:
+                        Summary.objects.bulk_create([
+                            Summary(book=book_in_db, text=text)
+                            for text in book['summaries']
+                        ])
+                    else:
+                        existing_summaries = {
+                            s.text: s for s in Summary.objects.filter(book=book_in_db)
+                        }
+                        new_texts = set(book['summaries'])
+                        to_create = [
+                            Summary(book=book_in_db, text=text)
+                            for text in new_texts
+                            if text not in existing_summaries
+                        ]
+                        if to_create:
+                            Summary.objects.bulk_create(to_create)
+
+                        stale_ids = {
+                            s.id for text, s in existing_summaries.items()
+                            if text not in new_texts
+                        }
+                        if stale_ids:
+                            Summary.objects.filter(id__in=stale_ids).delete()
+
+            except Exception as error:
+                book_json = json.dumps(book, indent=4)
+                log(
+                    '  Error while putting this book info in the database:\n',
+                    book_json,
+                    '\n'
+                )
+                raise error
+
+            stat_cache[directory] = [st.st_mtime_ns, st.st_size]
+            processed += 1
+
+            if processed % 500 == 0:
+                now = strftime('%H:%M:%S')
+                elapsed = time() - batch_start
+                log('    %s  [processed=%d  id=%d]  skipped=%d  (%.1fs)' % (
+                    now, processed, id, skipped, elapsed))
+                batch_start = time()
+                save_stat_cache(stat_cache, quiet=True)
+
+        pending.clear()
+
     for directory in book_directories:
         id = int(directory)
-
 
         book_path = os.path.join(
             settings.CATALOG_RDF_DIR,
@@ -154,171 +346,12 @@ def put_catalog_in_db(stat_cache):
             skipped += 1
             continue
 
-        book = utils.get_book(id, book_path)
+        pending.append((directory, id, book_path, st))
 
-        try:
-            with transaction.atomic():
-                '''Make/update the book.'''
+        if len(pending) >= _BATCH_SIZE:
+            flush_pending()
 
-                # Single query: .first() returns the object or None.
-                book_in_db = Book.objects.filter(gutenberg_id=id).first()
-                related_books_str = ','.join(str(i) for i in book['related_books'])
-                is_new = book_in_db is None
-
-                if not is_new:
-                    book_in_db.copyright = book['copyright']
-                    book_in_db.download_count = book['downloads']
-                    book_in_db.media_type = book['type']
-                    book_in_db.title = book['title']
-                    book_in_db.published_year = book['published_year']
-                    book_in_db.wikipedia_url = book['wikipedia_url']
-                    book_in_db.reading_score = book['reading_score']
-                    book_in_db.reading_score_value = book['reading_score_value']
-                    book_in_db.related_books = related_books_str
-                    book_in_db.save()
-                else:
-                    book_in_db = Book.objects.create(
-                        gutenberg_id=id,
-                        copyright=book['copyright'],
-                        download_count=book['downloads'],
-                        media_type=book['type'],
-                        title=book['title'],
-                        published_year=book['published_year'],
-                        wikipedia_url=book['wikipedia_url'],
-                        reading_score=book['reading_score'],
-                        reading_score_value=book['reading_score_value'],
-                        related_books=related_books_str,
-                    )
-
-                ''' Make/update the authors. '''
-
-                book_in_db.authors.set(
-                    [get_or_create_person(a, person_cache) for a in book['authors']],
-                    clear=not is_new,
-                )
-
-                ''' Make/update the editors. '''
-
-                editors = [get_or_create_person(e, person_cache) for e in book['editors']]
-                if editors:
-                    book_in_db.editors.set(editors, clear=not is_new)
-                elif not is_new:
-                    book_in_db.editors.clear()
-
-                ''' Make/update the translators. '''
-
-                translators = [get_or_create_person(t, person_cache) for t in book['translators']]
-                if translators:
-                    book_in_db.translators.set(translators, clear=not is_new)
-                elif not is_new:
-                    book_in_db.translators.clear()
-
-                ''' Make/update the book shelves. '''
-
-                bookshelves = []
-                for shelf in book['bookshelves']:
-                    if shelf not in bookshelf_cache:
-                        bookshelf_cache[shelf] = Bookshelf.objects.create(name=shelf)
-                    bookshelves.append(bookshelf_cache[shelf])
-
-                book_in_db.bookshelves.set(bookshelves, clear=not is_new)
-
-                ''' Make/update the formats. '''
-
-                # New books have no existing formats — skip the SELECT and go
-                # straight to bulk_create. For existing books, load in one query.
-                if is_new:
-                    Format.objects.bulk_create([
-                        Format(book=book_in_db, mime_type=mt, url=url)
-                        for mt, url in book['formats'].items()
-                    ])
-                else:
-                    existing_formats = {
-                        (f.mime_type, f.url): f
-                        for f in Format.objects.filter(book=book_in_db)
-                    }
-                    keep_ids = set()
-                    to_create = []
-                    for mime_type, url in book['formats'].items():
-                        key = (mime_type, url)
-                        if key in existing_formats:
-                            keep_ids.add(existing_formats[key].id)
-                        else:
-                            to_create.append(Format(book=book_in_db, mime_type=mime_type, url=url))
-
-                    if to_create:
-                        Format.objects.bulk_create(to_create)
-
-                    stale_ids = {f.id for f in existing_formats.values()} - keep_ids
-                    if stale_ids:
-                        Format.objects.filter(id__in=stale_ids).delete()
-
-                ''' Make/update the languages. '''
-
-                languages = []
-                for language in book['languages']:
-                    if language not in language_cache:
-                        language_cache[language] = Language.objects.create(code=language)
-                    languages.append(language_cache[language])
-
-                book_in_db.languages.set(languages, clear=not is_new)
-
-                ''' Make/update subjects. '''
-
-                subjects = []
-                for subject in book['subjects']:
-                    if subject not in subject_cache:
-                        subject_cache[subject], _ = Subject.objects.get_or_create(name=subject)
-                    subjects.append(subject_cache[subject])
-
-                book_in_db.subjects.set(subjects, clear=not is_new)
-
-                ''' Make/update summaries. '''
-
-                if is_new:
-                    Summary.objects.bulk_create([
-                        Summary(book=book_in_db, text=text)
-                        for text in book['summaries']
-                    ])
-                else:
-                    existing_summaries = {
-                        s.text: s for s in Summary.objects.filter(book=book_in_db)
-                    }
-                    new_texts = set(book['summaries'])
-                    to_create = [
-                        Summary(book=book_in_db, text=text)
-                        for text in new_texts
-                        if text not in existing_summaries
-                    ]
-                    if to_create:
-                        Summary.objects.bulk_create(to_create)
-
-                    stale_ids = {
-                        s.id for text, s in existing_summaries.items()
-                        if text not in new_texts
-                    }
-                    if stale_ids:
-                        Summary.objects.filter(id__in=stale_ids).delete()
-
-        except Exception as error:
-            book_json = json.dumps(book, indent=4)
-            log(
-                '  Error while putting this book info in the database:\n',
-                book_json,
-                '\n'
-            )
-            raise error
-
-        stat_cache[directory] = [st.st_mtime_ns, st.st_size]
-        processed += 1
-
-        if processed % 500 == 0:
-            now = strftime('%H:%M:%S')
-            elapsed = time() - batch_start
-            log('    %s  [processed=%d  id=%d]  skipped=%d  (%.1fs)' % (
-                now, processed, id, skipped, elapsed))
-            batch_start = time()
-            save_stat_cache(stat_cache, quiet=True)
+    flush_pending()  # process any remaining books
 
     total_elapsed = _fmt_duration(time() - total_start)
     log('    Skipped (unchanged): %d  Processed: %d  Total: %s' % (
