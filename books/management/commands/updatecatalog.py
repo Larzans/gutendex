@@ -2,7 +2,7 @@ from subprocess import call
 import json
 import os
 import shutil
-from time import strftime
+from time import strftime, time
 import sys
 import urllib.request
 
@@ -62,20 +62,28 @@ def load_stat_cache():
         return {}
 
 
-def save_stat_cache(cache):
+def save_stat_cache(cache, quiet=False):
     tmp = CACHE_PATH + '.tmp'
     try:
         with open(tmp, 'w') as f:
             json.dump(cache, f, separators=(',', ':'))
         os.replace(tmp, CACHE_PATH)
-        size_kb = os.path.getsize(CACHE_PATH) / 1024
-        log('  Stat cache saved: %s (%.1f KB)' % (CACHE_PATH, size_kb))
+        if not quiet:
+            size_kb = os.path.getsize(CACHE_PATH) / 1024
+            log('  Stat cache saved: %s (%.1f KB)' % (CACHE_PATH, size_kb))
     except Exception as e:
         log('  Warning: stat cache could not be saved (%s).' % e)
         try:
             os.remove(tmp)
         except OSError:
             pass
+
+
+def _fmt_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return '%ds' % seconds
+    return '%dm %ds' % (seconds // 60, seconds % 60)
 
 
 def put_catalog_in_db(stat_cache):
@@ -95,12 +103,18 @@ def put_catalog_in_db(stat_cache):
 
     skipped = 0
     processed = 0
+    total_start = time()
+    batch_start = time()
 
     for directory in book_directories:
         id = int(directory)
 
         if (id > 0) and (id % 500 == 0):
-            log('    %d' % id)
+            now = strftime('%H:%M:%S')
+            elapsed = time() - batch_start
+            log('    %s  [%6d]  skipped=%d  processed=%d  (%.1fs)' % (
+                now, id, skipped, processed, elapsed))
+            batch_start = time()
 
         book_path = os.path.join(
             settings.CATALOG_RDF_DIR,
@@ -281,7 +295,12 @@ def put_catalog_in_db(stat_cache):
         stat_cache[directory] = [st.st_mtime_ns, st.st_size]
         processed += 1
 
-    log('    Skipped (unchanged): %d  Processed: %d' % (skipped, processed))
+        if processed % 500 == 0:
+            save_stat_cache(stat_cache, quiet=True)
+
+    total_elapsed = _fmt_duration(time() - total_start)
+    log('    Skipped (unchanged): %d  Processed: %d  Total: %s' % (
+        skipped, processed, total_elapsed))
     return stat_cache, {str(id) for id in book_ids}
 
 
