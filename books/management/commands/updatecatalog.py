@@ -155,12 +155,24 @@ def put_catalog_in_db(stat_cache):
         if not pending:
             return
 
-        # One SELECT for the entire batch.
+        # Three SELECTs for the entire batch — one each for books, formats,
+        # and summaries — replacing up to 3×BATCH_SIZE individual queries.
         batch_ids = [p[1] for p in pending]
+
         books_in_db = {
             b.gutenberg_id: b
             for b in Book.objects.filter(gutenberg_id__in=batch_ids)
         }
+        # Keyed by book.gutenberg_id → list of Format/Summary objects.
+        # Only fetched for existing books (new books have nothing to load).
+        existing_book_ids = list(books_in_db.keys())
+        batch_formats = {}
+        batch_summaries = {}
+        if existing_book_ids:
+            for f in Format.objects.filter(book__gutenberg_id__in=existing_book_ids):
+                batch_formats.setdefault(f.book_id, []).append(f)
+            for s in Summary.objects.filter(book__gutenberg_id__in=existing_book_ids):
+                batch_summaries.setdefault(s.book_id, []).append(s)
 
         for directory, id, book_path, st in pending:
             book = utils.get_book(id, book_path)
@@ -244,7 +256,7 @@ def put_catalog_in_db(stat_cache):
                     else:
                         existing_formats = {
                             (f.mime_type, f.url): f
-                            for f in Format.objects.filter(book=book_in_db)
+                            for f in batch_formats.get(book_in_db.pk, [])
                         }
                         keep_ids = set()
                         to_create = []
@@ -291,7 +303,7 @@ def put_catalog_in_db(stat_cache):
                         ])
                     else:
                         existing_summaries = {
-                            s.text: s for s in Summary.objects.filter(book=book_in_db)
+                            s.text: s for s in batch_summaries.get(book_in_db.pk, [])
                         }
                         new_texts = set(book['summaries'])
                         to_create = [
@@ -365,6 +377,25 @@ def put_catalog_in_db(stat_cache):
             Bookshelf.objects.count(), Language.objects.count(),
             Subject.objects.count(), Format.objects.count(),
             Summary.objects.count()))
+
+    # Refresh PostgreSQL query planner statistics after a large import so that
+    # subsequent API queries use accurate cost estimates.
+    if processed > 0:
+        log('  Running VACUUM ANALYZE on affected tables...')
+        _tables = [
+            'books_book', 'books_format', 'books_summary',
+            'books_book_authors', 'books_book_editors', 'books_book_translators',
+            'books_book_bookshelves', 'books_book_languages', 'books_book_subjects',
+        ]
+        prev_autocommit = connection.autocommit
+        connection.set_autocommit(True)
+        try:
+            with connection.cursor() as cur:
+                for table in _tables:
+                    cur.execute('VACUUM ANALYZE %s' % table)
+        finally:
+            connection.set_autocommit(prev_autocommit)
+        log('  VACUUM ANALYZE done.')
 
     return stat_cache, {str(id) for id in book_ids}
 
