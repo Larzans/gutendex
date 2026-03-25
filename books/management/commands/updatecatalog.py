@@ -108,16 +108,13 @@ def _set_m2m_if_changed(m2m_manager, new_objects, is_new):
 
 def put_catalog_in_db(stat_cache, limit=None):
     book_ids = []
-    for directory_item in os.listdir(settings.CATALOG_RDF_DIR):
-        item_path = os.path.join(settings.CATALOG_RDF_DIR, directory_item)
-        if os.path.isdir(item_path):
-            try:
-                book_id = int(directory_item)
-            except ValueError:
-                # Ignore the item if it's not a book ID number.
-                pass
-            else:
-                book_ids.append(book_id)
+    with os.scandir(settings.CATALOG_RDF_DIR) as it:
+        for entry in it:
+            if entry.is_dir():
+                try:
+                    book_ids.append(int(entry.name))
+                except ValueError:
+                    pass
     book_ids.sort()
     if limit is not None:
         book_ids = book_ids[:limit]
@@ -144,15 +141,13 @@ def put_catalog_in_db(stat_cache, limit=None):
     with connection.cursor() as cur:
         cur.execute("SET synchronous_commit = off")
 
-    # Pre-load small lookup tables (bookshelves, languages) into memory.
-    # Subjects and persons use lazy caches — built during the run to avoid
-    # loading large tables upfront while still skipping repeated DB hits.
+    # Pre-load lookup tables into memory to avoid per-book DB round-trips.
     bookshelf_cache = {b.name: b for b in Bookshelf.objects.all()}
     language_cache  = {l.code: l for l in Language.objects.all()}
     subject_cache   = {s.name: s for s in Subject.objects.all()}
-    person_cache    = {}  # keyed by gutenberg_id (int)
-    log('  Caches loaded:  bookshelves=%d  languages=%d  subjects=%d' % (
-        len(bookshelf_cache), len(language_cache), len(subject_cache)))
+    person_cache    = {p.gutenberg_id: p for p in Person.objects.filter(gutenberg_id__isnull=False)}
+    log('  Caches loaded:  bookshelves=%d  languages=%d  subjects=%d  persons=%d' % (
+        len(bookshelf_cache), len(language_cache), len(subject_cache), len(person_cache)))
 
     skipped = 0
     processed = 0
