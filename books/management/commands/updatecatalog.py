@@ -106,7 +106,7 @@ def _set_m2m_if_changed(m2m_manager, new_objects, is_new):
         m2m_manager.set(new_objects, clear=True)
 
 
-def put_catalog_in_db(stat_cache):
+def put_catalog_in_db(stat_cache, limit=None):
     book_ids = []
     for directory_item in os.listdir(settings.CATALOG_RDF_DIR):
         item_path = os.path.join(settings.CATALOG_RDF_DIR, directory_item)
@@ -119,6 +119,8 @@ def put_catalog_in_db(stat_cache):
             else:
                 book_ids.append(book_id)
     book_ids.sort()
+    if limit is not None:
+        book_ids = book_ids[:limit]
     book_directories = [str(id) for id in book_ids]
 
     # DB diagnostics — logged before the loop so problems are visible up front.
@@ -147,10 +149,10 @@ def put_catalog_in_db(stat_cache):
     # loading large tables upfront while still skipping repeated DB hits.
     bookshelf_cache = {b.name: b for b in Bookshelf.objects.all()}
     language_cache  = {l.code: l for l in Language.objects.all()}
-    subject_cache   = {}
+    subject_cache   = {s.name: s for s in Subject.objects.all()}
     person_cache    = {}  # keyed by gutenberg_id (int)
-    log('  Caches loaded:  bookshelves=%d  languages=%d' % (
-        len(bookshelf_cache), len(language_cache)))
+    log('  Caches loaded:  bookshelves=%d  languages=%d  subjects=%d' % (
+        len(bookshelf_cache), len(language_cache), len(subject_cache)))
 
     skipped = 0
     processed = 0
@@ -316,7 +318,7 @@ def put_catalog_in_db(stat_cache):
                     subjects = []
                     for subject in book['subjects']:
                         if subject not in subject_cache:
-                            subject_cache[subject], _ = Subject.objects.get_or_create(name=subject)
+                            subject_cache[subject] = Subject.objects.create(name=subject)
                         subjects.append(subject_cache[subject])
                     _set_m2m_if_changed(book_in_db.subjects, subjects, is_new)
 
