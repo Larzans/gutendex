@@ -87,6 +87,25 @@ def _fmt_duration(seconds):
     return '%dm %ds' % (seconds // 60, seconds % 60)
 
 
+def _set_m2m_if_changed(m2m_manager, new_objects, is_new):
+    """Update an M2M relation only when the set of related objects has changed.
+
+    For new books every relation is new — just add without comparing.
+    For existing books, compare current PKs (from the prefetch cache) against
+    the incoming PKs; skip the DELETE+INSERT entirely when they are equal.
+    Handles the empty-list case: clears all relations if new_objects is empty
+    and the current set is non-empty.
+    """
+    if is_new:
+        if new_objects:
+            m2m_manager.set(new_objects, clear=False)
+        return
+    new_pks = {obj.pk for obj in new_objects}
+    current_pks = {obj.pk for obj in m2m_manager.all()}  # uses prefetch cache
+    if new_pks != current_pks:
+        m2m_manager.set(new_objects, clear=True)
+
+
 def put_catalog_in_db(stat_cache):
     book_ids = []
     for directory_item in os.listdir(settings.CATALOG_RDF_DIR):
@@ -155,16 +174,18 @@ def put_catalog_in_db(stat_cache):
         if not pending:
             return
 
-        # Three SELECTs for the entire batch — one each for books, formats,
-        # and summaries — replacing up to 3×BATCH_SIZE individual queries.
+        # ── Batch SELECTs ─────────────────────────────────────────────────────
+        # Load books with M2M prefetch so phase-2 PK comparisons use the cache
+        # instead of hitting the DB per book.  Formats and summaries are loaded
+        # separately (they are FK relations, not M2M through-tables).
         batch_ids = [p[1] for p in pending]
 
         books_in_db = {
             b.gutenberg_id: b
             for b in Book.objects.filter(gutenberg_id__in=batch_ids)
+                .prefetch_related('authors', 'editors', 'translators',
+                                  'bookshelves', 'languages', 'subjects')
         }
-        # Keyed by book.gutenberg_id → list of Format/Summary objects.
-        # Only fetched for existing books (new books have nothing to load).
         existing_book_ids = list(books_in_db.keys())
         batch_formats = {}
         batch_summaries = {}
@@ -174,80 +195,91 @@ def put_catalog_in_db(stat_cache):
             for s in Summary.objects.filter(book__gutenberg_id__in=existing_book_ids):
                 batch_summaries.setdefault(s.book_id, []).append(s)
 
+        # ── Phase 1: parse RDF files; prepare bulk write lists ────────────────
+        # Assign new field values to existing Book objects (for bulk_update) and
+        # build unsaved Book objects for new entries (for bulk_create).
+        # Parsing happens here — outside any transaction — to keep transactions
+        # as short as possible.
+        book_records    = []  # (directory, id, st, book_dict, is_new)
+        books_to_update = []  # existing Book objects with updated field values
+        books_to_create = []  # unsaved Book objects for new entries
+
         for directory, id, book_path, st in pending:
             book = utils.get_book(id, book_path)
+            related_books_str = ','.join(str(i) for i in book['related_books'])
             book_in_db = books_in_db.get(id)
             is_new = book_in_db is None
 
+            if not is_new:
+                book_in_db.copyright           = book['copyright']
+                book_in_db.download_count       = book['downloads']
+                book_in_db.media_type           = book['type']
+                book_in_db.title                = book['title']
+                book_in_db.published_year       = book['published_year']
+                book_in_db.wikipedia_url        = book['wikipedia_url']
+                book_in_db.reading_score        = book['reading_score']
+                book_in_db.reading_score_value  = book['reading_score_value']
+                book_in_db.related_books        = related_books_str
+                books_to_update.append(book_in_db)
+            else:
+                books_to_create.append(Book(
+                    gutenberg_id=id,
+                    copyright=book['copyright'],
+                    download_count=book['downloads'],
+                    media_type=book['type'],
+                    title=book['title'],
+                    published_year=book['published_year'],
+                    wikipedia_url=book['wikipedia_url'],
+                    reading_score=book['reading_score'],
+                    reading_score_value=book['reading_score_value'],
+                    related_books=related_books_str,
+                ))
+
+            book_records.append((directory, id, st, book, is_new))
+
+        # One UPDATE for all changed existing books; one INSERT for all new books.
+        if books_to_update:
+            Book.objects.bulk_update(books_to_update, _BOOK_UPDATE_FIELDS)
+        if books_to_create:
+            for b in Book.objects.bulk_create(books_to_create):
+                books_in_db[b.gutenberg_id] = b
+
+        # ── Phase 2: per-book M2M, formats, summaries ─────────────────────────
+        for directory, id, st, book, is_new in book_records:
+            book_in_db = books_in_db[id]
+
             try:
                 with transaction.atomic():
-                    '''Make/update the book.'''
-
-                    related_books_str = ','.join(str(i) for i in book['related_books'])
-
-                    if not is_new:
-                        book_in_db.copyright = book['copyright']
-                        book_in_db.download_count = book['downloads']
-                        book_in_db.media_type = book['type']
-                        book_in_db.title = book['title']
-                        book_in_db.published_year = book['published_year']
-                        book_in_db.wikipedia_url = book['wikipedia_url']
-                        book_in_db.reading_score = book['reading_score']
-                        book_in_db.reading_score_value = book['reading_score_value']
-                        book_in_db.related_books = related_books_str
-                        book_in_db.save(update_fields=_BOOK_UPDATE_FIELDS)
-                    else:
-                        book_in_db = Book.objects.create(
-                            gutenberg_id=id,
-                            copyright=book['copyright'],
-                            download_count=book['downloads'],
-                            media_type=book['type'],
-                            title=book['title'],
-                            published_year=book['published_year'],
-                            wikipedia_url=book['wikipedia_url'],
-                            reading_score=book['reading_score'],
-                            reading_score_value=book['reading_score_value'],
-                            related_books=related_books_str,
-                        )
-
                     ''' Make/update the authors. '''
-
-                    book_in_db.authors.set(
+                    _set_m2m_if_changed(
+                        book_in_db.authors,
                         [get_or_create_person(a, person_cache) for a in book['authors']],
-                        clear=not is_new,
+                        is_new,
                     )
 
                     ''' Make/update the editors. '''
-
-                    editors = [get_or_create_person(e, person_cache) for e in book['editors']]
-                    if editors:
-                        book_in_db.editors.set(editors, clear=not is_new)
-                    elif not is_new:
-                        book_in_db.editors.clear()
+                    _set_m2m_if_changed(
+                        book_in_db.editors,
+                        [get_or_create_person(e, person_cache) for e in book['editors']],
+                        is_new,
+                    )
 
                     ''' Make/update the translators. '''
-
-                    translators = [get_or_create_person(t, person_cache) for t in book['translators']]
-                    if translators:
-                        book_in_db.translators.set(translators, clear=not is_new)
-                    elif not is_new:
-                        book_in_db.translators.clear()
+                    _set_m2m_if_changed(
+                        book_in_db.translators,
+                        [get_or_create_person(t, person_cache) for t in book['translators']],
+                        is_new,
+                    )
 
                     ''' Make/update the book shelves. '''
-
                     bookshelves = []
                     for shelf in book['bookshelves']:
                         if shelf not in bookshelf_cache:
                             bookshelf_cache[shelf] = Bookshelf.objects.create(name=shelf)
                         bookshelves.append(bookshelf_cache[shelf])
-
-                    book_in_db.bookshelves.set(bookshelves, clear=not is_new)
+                    _set_m2m_if_changed(book_in_db.bookshelves, bookshelves, is_new)
 
                     ''' Make/update the formats. '''
-
-                    # New books have no existing formats — skip the SELECT and
-                    # go straight to bulk_create. For existing books, load in
-                    # one query, compare in Python, bulk create/delete.
                     if is_new:
                         Format.objects.bulk_create([
                             Format(book=book_in_db, mime_type=mt, url=url)
@@ -266,36 +298,29 @@ def put_catalog_in_db(stat_cache):
                                 keep_ids.add(existing_formats[key].id)
                             else:
                                 to_create.append(Format(book=book_in_db, mime_type=mime_type, url=url))
-
                         if to_create:
                             Format.objects.bulk_create(to_create)
-
                         stale_ids = {f.id for f in existing_formats.values()} - keep_ids
                         if stale_ids:
                             Format.objects.filter(id__in=stale_ids).delete()
 
                     ''' Make/update the languages. '''
-
                     languages = []
                     for language in book['languages']:
                         if language not in language_cache:
                             language_cache[language] = Language.objects.create(code=language)
                         languages.append(language_cache[language])
-
-                    book_in_db.languages.set(languages, clear=not is_new)
+                    _set_m2m_if_changed(book_in_db.languages, languages, is_new)
 
                     ''' Make/update subjects. '''
-
                     subjects = []
                     for subject in book['subjects']:
                         if subject not in subject_cache:
                             subject_cache[subject], _ = Subject.objects.get_or_create(name=subject)
                         subjects.append(subject_cache[subject])
-
-                    book_in_db.subjects.set(subjects, clear=not is_new)
+                    _set_m2m_if_changed(book_in_db.subjects, subjects, is_new)
 
                     ''' Make/update summaries. '''
-
                     if is_new:
                         Summary.objects.bulk_create([
                             Summary(book=book_in_db, text=text)
@@ -313,7 +338,6 @@ def put_catalog_in_db(stat_cache):
                         ]
                         if to_create:
                             Summary.objects.bulk_create(to_create)
-
                         stale_ids = {
                             s.id for text, s in existing_summaries.items()
                             if text not in new_texts
