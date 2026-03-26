@@ -28,6 +28,7 @@ LOG_FILE_NAME = strftime('%Y-%m-%d_%H%M%S') + '.txt'
 LOG_PATH = os.path.join(LOG_DIRECTORY, LOG_FILE_NAME)
 
 CACHE_PATH = os.path.join(os.path.dirname(settings.CATALOG_RDF_DIR), 'rdf_stat_cache.json')
+LAST_MODIFIED_PATH = os.path.join(os.path.dirname(settings.CATALOG_RDF_DIR), 'catalog_last_modified.txt')
 
 
 # This gives a set of the names of the subdirectories in the given file path.
@@ -41,12 +42,40 @@ def get_directory_set(path):
 
 
 def log(*args):
-    print(*args)
+    now = strftime('%H:%M:%S')
+    text = now + '  ' + ' '.join(args)
+    print(text)
     if not os.path.exists(LOG_DIRECTORY):
         os.makedirs(LOG_DIRECTORY)
     with open(LOG_PATH, 'a') as log_file:
-        text = ' '.join(args) + '\n'
-        log_file.write(text)
+        log_file.write(text + '\n')
+
+
+def _get_remote_last_modified(url):
+    """Return the Last-Modified header string for *url*, or None on failure."""
+    try:
+        req = urllib.request.Request(url, method='HEAD')
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.headers.get('Last-Modified')
+    except Exception as e:
+        log('  Warning: could not check remote file date (%s); will download.' % e)
+        return None
+
+
+def _read_local_last_modified():
+    try:
+        with open(LAST_MODIFIED_PATH) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _save_local_last_modified(value):
+    try:
+        with open(LAST_MODIFIED_PATH, 'w') as f:
+            f.write(value)
+    except OSError as e:
+        log('  Warning: could not save last-modified stamp (%s).' % e)
 
 
 def load_stat_cache():
@@ -355,10 +384,9 @@ def put_catalog_in_db(stat_cache, limit=None):
             processed += 1
 
             if processed % 500 == 0:
-                now = strftime('%H:%M:%S')
                 elapsed = time() - batch_start
-                log('    %s  [processed=%d  id=%d]  skipped=%d  (%.1fs)' % (
-                    now, processed, id, skipped, elapsed))
+                log('  [processed=%d  id=%d]  skipped=%d  (%.1fs)' % (
+                    processed, id, skipped, elapsed))
                 batch_start = time()
                 save_stat_cache(stat_cache, quiet=True)
 
@@ -387,7 +415,7 @@ def put_catalog_in_db(stat_cache, limit=None):
     flush_pending()  # process any remaining books
 
     total_elapsed = _fmt_duration(time() - total_start)
-    log('    Skipped (unchanged): %d  Processed: %d  Total: %s' % (
+    log('  Skipped (unchanged): %d  Processed: %d  Total: %s' % (
         skipped, processed, total_elapsed))
 
     # DB diagnostics after the run — compare with the before numbers to spot
@@ -525,6 +553,28 @@ def prime_rdf_cache():
     log('  Primed cache with %d files.' % count)
 
 
+def _download_with_progress(url, dest):
+    """Download *url* to *dest*, printing a live progress bar to stdout."""
+    def reporthook(block_count, block_size, total_size):
+        downloaded = block_count * block_size
+        if total_size > 0:
+            pct = min(downloaded / total_size * 100, 100)
+            filled = int(40 * pct / 100)
+            bar = '█' * filled + '░' * (40 - filled)
+            mb_done = downloaded / 1_048_576
+            mb_total = total_size / 1_048_576
+            sys.stdout.write(
+                f'\r          [{bar}] {pct:5.1f}%  {mb_done:.0f}/{mb_total:.0f} MB'
+            )
+        else:
+            sys.stdout.write(f'\r          {block_count * block_size / 1_048_576:.0f} MB downloaded...')
+        sys.stdout.flush()
+
+    urllib.request.urlretrieve(url, dest, reporthook=reporthook)
+    sys.stdout.write('\n')
+    sys.stdout.flush()
+
+
 class Command(BaseCommand):
     help = 'This replaces the catalog files with the latest ones.'
 
@@ -552,7 +602,7 @@ class Command(BaseCommand):
             date_and_time = strftime('%H:%M:%S on %B %d, %Y')
             log('Starting script at', date_and_time)
 
-            log('  Making temporary directory...')
+            log('Making temporary directory...')
             if os.path.exists(TEMP_PATH):
                 raise CommandError(
                     'The temporary path, `' + TEMP_PATH + '`, already exists.'
@@ -560,10 +610,23 @@ class Command(BaseCommand):
             else:
                 os.makedirs(TEMP_PATH)
 
-            log('  Downloading compressed catalog...')
-            urllib.request.urlretrieve(URL, DOWNLOAD_PATH)
+            log('Checking remote catalog date...')
+            remote_lm = _get_remote_last_modified(URL)
+            local_lm = _read_local_last_modified()
+            if remote_lm and remote_lm == local_lm:
+                log('Catalog unchanged (Last-Modified: %s); skipping download.' % remote_lm)
+                shutil.rmtree(TEMP_PATH)
+                log('Done!')
+                send_log_email()
+                return
+            if remote_lm:
+                log('  Remote Last-Modified: %s' % remote_lm)
+            log('Downloading compressed catalog...')
+            _download_with_progress(URL, DOWNLOAD_PATH)
+            if remote_lm:
+                _save_local_last_modified(remote_lm)
 
-            log('  Decompressing catalog...')
+            log('Decompressing catalog...')
             if not os.path.exists(DOWNLOAD_PATH):
                 os.makedirs(DOWNLOAD_PATH)
             with open(os.devnull, 'w') as null:
@@ -573,14 +636,14 @@ class Command(BaseCommand):
                     stderr=null
                 )
 
-            log('  Detecting stale directories...')
+            log('Detecting stale directories...')
             if not os.path.exists(MOVE_TARGET_PATH):
                 os.makedirs(MOVE_TARGET_PATH)
             new_directory_set = get_directory_set(MOVE_SOURCE_PATH)
             old_directory_set = get_directory_set(MOVE_TARGET_PATH)
             stale_directory_set = old_directory_set - new_directory_set
 
-            log('  Removing stale directories and books...')
+            log('Removing stale directories and books...')
             for directory in stale_directory_set:
                 try:
                     book_id = int(directory)
@@ -592,7 +655,7 @@ class Command(BaseCommand):
                 path = os.path.join(MOVE_TARGET_PATH, directory)
                 shutil.rmtree(path)
 
-            log('  Replacing old catalog files...')
+            log('Replacing old catalog files...')
             with open(os.devnull, 'w') as null:
                 with open(LOG_PATH, 'a') as log_file:
                     call(
@@ -607,13 +670,13 @@ class Command(BaseCommand):
                         stderr=log_file
                     )
 
-            log('  Putting the catalog in the database...')
+            log('Putting the catalog in the database...')
             stat_cache = load_stat_cache()
             stat_cache, seen_ids = put_catalog_in_db(stat_cache)
             stat_cache = {k: v for k, v in stat_cache.items() if k in seen_ids}
             save_stat_cache(stat_cache)
 
-            log('  Removing temporary files...')
+            log('Removing temporary files...')
             shutil.rmtree(TEMP_PATH)
 
             log('Done!\n')
