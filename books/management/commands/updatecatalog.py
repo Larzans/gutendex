@@ -1,8 +1,10 @@
-from subprocess import call
+import subprocess
+from subprocess import call, Popen
 import json
 import os
 import shutil
-from time import strftime, time
+import threading
+from time import sleep, strftime, time
 import sys
 import urllib.request
 
@@ -30,6 +32,8 @@ LOG_PATH = os.path.join(LOG_DIRECTORY, LOG_FILE_NAME)
 CACHE_PATH = os.path.join(os.path.dirname(settings.CATALOG_RDF_DIR), 'rdf_stat_cache.json')
 LAST_MODIFIED_PATH = os.path.join(os.path.dirname(settings.CATALOG_RDF_DIR), 'catalog_last_modified.txt')
 
+_quiet_mode = False
+
 
 # This gives a set of the names of the subdirectories in the given file path.
 def get_directory_set(path):
@@ -41,10 +45,11 @@ def get_directory_set(path):
     return directory_set
 
 
-def log(*args):
+def log(*args, force=False):
     now = strftime('%H:%M:%S')
     text = now + '  ' + ' '.join(args)
-    print(text)
+    if not _quiet_mode or force:
+        print(text)
     if not os.path.exists(LOG_DIRECTORY):
         os.makedirs(LOG_DIRECTORY)
     with open(LOG_PATH, 'a') as log_file:
@@ -446,7 +451,7 @@ def put_catalog_in_db(stat_cache, limit=None):
             connection.set_autocommit(prev_autocommit)
         log('  VACUUM ANALYZE done.')
 
-    return stat_cache, {str(id) for id in book_ids}
+    return stat_cache, {str(id) for id in book_ids}, processed, skipped
 
 
 def get_or_create_person(data, cache):
@@ -553,8 +558,71 @@ def prime_rdf_cache():
     log('  Primed cache with %d files.' % count)
 
 
-def _download_with_progress(url, dest):
+def _extracted_size_mb(path):
+    """Return the total size of all files under *path* in MB using du."""
+    try:
+        out = subprocess.check_output(['du', '-sb', path], stderr=subprocess.DEVNULL)
+        return int(out.split()[0]) / 1_048_576
+    except Exception:
+        return 0
+
+
+def _decompress_with_progress(src, dest_dir, quiet=False):
+    """Extract *src* (a .tar.bz2 file) to *dest_dir*, showing an approximate
+    progress bar by counting extracted subdirectories every 2 seconds.
+    Returns (actual_dirs, size_mb)."""
+    extract_target = MOVE_SOURCE_PATH  # cache/epub/ inside dest_dir
+
+    with open(os.devnull, 'w') as null:
+        proc = Popen(['tar', 'xjf', src, '-C', dest_dir], stdout=null, stderr=null)
+
+    if not quiet:
+        expected = Book.objects.count() or 70_000
+
+        def _monitor():
+            while proc.poll() is None:
+                try:
+                    count = len(os.listdir(extract_target))
+                except FileNotFoundError:
+                    count = 0
+                pct = min(count / expected * 100, 100)
+                filled = int(40 * pct / 100)
+                bar = '█' * filled + '░' * (40 - filled)
+                sys.stdout.write(
+                    f'\r          [{bar}] {pct:4.0f}%  ~{count:,} / {expected:,} dirs'
+                )
+                sys.stdout.flush()
+                sleep(2)
+
+        t = threading.Thread(target=_monitor, daemon=True)
+        t.start()
+
+    proc.wait()
+
+    if not quiet:
+        t.join()
+
+    try:
+        actual = len(os.listdir(extract_target))
+    except FileNotFoundError:
+        actual = 0
+
+    size_mb = _extracted_size_mb(extract_target)
+
+    if not quiet:
+        bar = '█' * 40
+        sys.stdout.write(f'\r          [{bar}] 100%  {actual:,} dirs  {size_mb:,.0f} MB               \n')
+        sys.stdout.flush()
+
+    return actual, size_mb
+
+
+def _download_with_progress(url, dest, quiet=False):
     """Download *url* to *dest*, printing a live progress bar to stdout."""
+    if quiet:
+        urllib.request.urlretrieve(url, dest)
+        return
+
     def reporthook(block_count, block_size, total_size):
         downloaded = block_count * block_size
         if total_size > 0:
@@ -590,17 +658,41 @@ class Command(BaseCommand):
                 'run only processes new or changed files.'
             ),
         )
+        parser.add_argument(
+            '--force-download',
+            action='store_true',
+            help=(
+                'Skip the Last-Modified check and always download and '
+                'decompress the RDF archive, even if it appears unchanged.'
+            ),
+        )
+        parser.add_argument(
+            '--minimal-log',
+            action='store_true',
+            help=(
+                'Suppress verbose output; print only the start line, '
+                'a download/decompress summary, and a catalog update summary '
+                'with total elapsed time. Errors are always shown.'
+            ),
+        )
 
     def handle(self, *args, **options):
+        global _quiet_mode
+
         if options['prime_rdf_cache']:
             log('Priming RDF stat cache...')
             prime_rdf_cache()
             log('Done!')
             return
 
+        force = options['force_download']
+        minimal_log = options['minimal_log']
+
         try:
+            start_time = time()
             date_and_time = strftime('%H:%M:%S on %B %d, %Y')
             log('Starting script at', date_and_time)
+            _quiet_mode = minimal_log
 
             log('Making temporary directory...')
             if os.path.exists(TEMP_PATH):
@@ -613,28 +705,29 @@ class Command(BaseCommand):
             log('Checking remote catalog date...')
             remote_lm = _get_remote_last_modified(URL)
             local_lm = _read_local_last_modified()
-            if remote_lm and remote_lm == local_lm:
+            if not force and remote_lm and remote_lm == local_lm:
                 log('Catalog unchanged (Last-Modified: %s); skipping download.' % remote_lm)
                 shutil.rmtree(TEMP_PATH)
-                log('Done!')
+                if minimal_log:
+                    elapsed = _fmt_duration(time() - start_time)
+                    log('Catalog unchanged (Last-Modified: %s) — total %s' % (
+                        remote_lm, elapsed), force=True)
+                else:
+                    log('Done!')
                 send_log_email()
                 return
             if remote_lm:
-                log('  Remote Last-Modified: %s' % remote_lm)
+                log('  Remote Last-Modified: %s%s' % (remote_lm, ' (forced)' if force else ''))
             log('Downloading compressed catalog...')
-            _download_with_progress(URL, DOWNLOAD_PATH)
+            _download_with_progress(URL, DOWNLOAD_PATH, quiet=minimal_log)
             if remote_lm:
                 _save_local_last_modified(remote_lm)
 
             log('Decompressing catalog...')
-            if not os.path.exists(DOWNLOAD_PATH):
-                os.makedirs(DOWNLOAD_PATH)
-            with open(os.devnull, 'w') as null:
-                call(
-                    ['tar', 'fjvx', DOWNLOAD_PATH, '-C', TEMP_PATH],
-                    stdout=null,
-                    stderr=null
-                )
+            actual_dirs, size_mb = _decompress_with_progress(DOWNLOAD_PATH, TEMP_PATH, quiet=minimal_log)
+            if minimal_log:
+                log('Archive downloaded and decompressed (%s dirs extracted, %s MB)' % (
+                    f'{actual_dirs:,}', f'{size_mb:,.0f}'), force=True)
 
             log('Detecting stale directories...')
             if not os.path.exists(MOVE_TARGET_PATH):
@@ -672,18 +765,25 @@ class Command(BaseCommand):
 
             log('Putting the catalog in the database...')
             stat_cache = load_stat_cache()
-            stat_cache, seen_ids = put_catalog_in_db(stat_cache)
+            stat_cache, seen_ids, processed, skipped = put_catalog_in_db(stat_cache)
             stat_cache = {k: v for k, v in stat_cache.items() if k in seen_ids}
             save_stat_cache(stat_cache)
 
             log('Removing temporary files...')
             shutil.rmtree(TEMP_PATH)
 
-            log('Done!\n')
+            if minimal_log:
+                elapsed = _fmt_duration(time() - start_time)
+                log('Catalog updated: %s books processed, %s skipped — total %s' % (
+                    f'{processed:,}', f'{skipped:,}', elapsed), force=True)
+            else:
+                log('Done!\n')
         except Exception as error:
             error_message = str(error)
-            log('Error:', error_message)
+            log('Error:', error_message, force=True)
             log('')
             shutil.rmtree(TEMP_PATH)
+        finally:
+            _quiet_mode = False
 
         send_log_email()
