@@ -687,7 +687,8 @@ class Command(BaseCommand):
 
         try:
             date_and_time = strftime('%H:%M:%S on %B %d, %Y')
-            log('Starting script at', date_and_time)
+            cmd_str = ' '.join(sys.argv[1:])
+            log("Starting '%s' at %s" % (cmd_str, date_and_time))
             _quiet_mode = minimal_log
 
             log('Making temporary directory...')
