@@ -37,12 +37,8 @@ _quiet_mode = False
 
 # This gives a set of the names of the subdirectories in the given file path.
 def get_directory_set(path):
-    directory_set = set()
-    for directory_item in os.listdir(path):
-        item_path = os.path.join(path, directory_item)
-        if os.path.isdir(item_path):
-            directory_set.add(directory_item)
-    return directory_set
+    with os.scandir(path) as it:
+        return {e.name for e in it if e.is_dir(follow_symlinks=False)}
 
 
 def log(*args, force=False):
@@ -539,21 +535,21 @@ def prime_rdf_cache():
         return
     cache = {}
     count = 0
-    for directory_item in os.listdir(settings.CATALOG_RDF_DIR):
-        item_path = os.path.join(settings.CATALOG_RDF_DIR, directory_item)
-        if not os.path.isdir(item_path):
-            continue
-        try:
-            int(directory_item)
-        except ValueError:
-            continue
-        rdf_path = os.path.join(item_path, 'pg' + directory_item + '.rdf')
-        try:
-            st = os.stat(rdf_path)
-        except OSError:
-            continue
-        cache[directory_item] = [st.st_mtime_ns, st.st_size]
-        count += 1
+    with os.scandir(settings.CATALOG_RDF_DIR) as it:
+        for entry in it:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                int(entry.name)
+            except ValueError:
+                continue
+            rdf_path = os.path.join(entry.path, 'pg' + entry.name + '.rdf')
+            try:
+                st = os.stat(rdf_path)
+            except OSError:
+                continue
+            cache[entry.name] = [st.st_mtime_ns, st.st_size]
+            count += 1
     save_stat_cache(cache)
     log('  Primed cache with %d files.' % count)
 
