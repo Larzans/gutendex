@@ -674,18 +674,18 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         global _quiet_mode
+        start_time = time()
 
         if options['prime_rdf_cache']:
             log('Priming RDF stat cache...')
             prime_rdf_cache()
-            log('Done!')
+            log('Done! (total %s)' % _fmt_duration(time() - start_time))
             return
 
         force = options['force_download']
         minimal_log = options['minimal_log']
 
         try:
-            start_time = time()
             date_and_time = strftime('%H:%M:%S on %B %d, %Y')
             log('Starting script at', date_and_time)
             _quiet_mode = minimal_log
@@ -709,7 +709,7 @@ class Command(BaseCommand):
                     log('Catalog unchanged (Last-Modified: %s) — total %s' % (
                         remote_lm, elapsed), force=True)
                 else:
-                    log('Done!')
+                    log('Done! (total %s)' % _fmt_duration(time() - start_time))
                 send_log_email()
                 return
             if remote_lm:
@@ -773,7 +773,7 @@ class Command(BaseCommand):
                 log('Catalog updated: %s books processed, %s skipped — total %s' % (
                     f'{processed:,}', f'{skipped:,}', elapsed), force=True)
             else:
-                log('Done!\n')
+                log('Done! (total %s)\n' % _fmt_duration(time() - start_time))
         except Exception as error:
             error_message = str(error)
             log('Error:', error_message, force=True)
