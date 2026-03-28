@@ -555,12 +555,21 @@ def prime_rdf_cache():
 
 
 def _extracted_size_mb(path):
-    """Return the total size of all files under *path* in MB using du."""
+    """Return the total size of all files under *path* in MB."""
     try:
-        out = subprocess.check_output(['du', '-sb', path], stderr=subprocess.DEVNULL)
-        return int(out.split()[0]) / 1_048_576
+        import platform
+        if platform.system() == 'Darwin':
+            out = subprocess.check_output(['du', '-sk', path], stderr=subprocess.DEVNULL)
+            return int(out.split()[0]) * 1024 / 1_048_576
+        else:
+            out = subprocess.check_output(['du', '-sb', path], stderr=subprocess.DEVNULL)
+            return int(out.split()[0]) / 1_048_576
     except Exception:
-        return 0
+        return sum(
+            os.path.getsize(os.path.join(dirpath, fname))
+            for dirpath, _, fnames in os.walk(path)
+            for fname in fnames
+        ) / 1_048_576
 
 
 def _decompress_with_progress(src, dest_dir, quiet=False):
