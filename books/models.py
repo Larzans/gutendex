@@ -69,6 +69,11 @@ class Person(models.Model):
     death_year = models.SmallIntegerField(blank=True, null=True)
     gutenberg_id = models.PositiveIntegerField(unique=True, null=True, blank=True)
     name = models.CharField(max_length=128)
+    wikipedia_url = models.URLField(max_length=512, blank=True, default='')
+    loc_url = models.URLField(max_length=512, blank=True, default='')
+    viaf_url = models.URLField(max_length=512, blank=True, default='')
+    birth_date = models.DateField(null=True, blank=True)
+    death_date = models.DateField(null=True, blank=True)
 
     def __str__(self):
         return self.name
