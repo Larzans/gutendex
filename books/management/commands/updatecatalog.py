@@ -186,8 +186,8 @@ def put_catalog_in_db(stat_cache, limit=None):
 
     _BOOK_UPDATE_FIELDS = [
         'copyright', 'download_count', 'media_type', 'title',
-        'published_year', 'wikipedia_url', 'reading_score',
-        'reading_score_value', 'related_books',
+        'published_year', 'issued_date', 'gt_modified', 'wikipedia_url',
+        'reading_score', 'reading_score_value', 'related_gt_books',
     ]
     _BATCH_SIZE = 200
 
@@ -233,7 +233,7 @@ def put_catalog_in_db(stat_cache, limit=None):
 
         for directory, id, book_path, st in pending:
             book = utils.get_book(id, book_path)
-            related_books_str = ','.join(str(i) for i in book['related_books'])
+            related_books_str = ','.join(str(i) for i in book['related_gt_books'])
             book_in_db = books_in_db.get(id)
             is_new = book_in_db is None
 
@@ -243,10 +243,12 @@ def put_catalog_in_db(stat_cache, limit=None):
                 book_in_db.media_type           = book['type']
                 book_in_db.title                = book['title']
                 book_in_db.published_year       = book['published_year']
+                book_in_db.issued_date          = book['issued_date']
+                book_in_db.gt_modified          = book['gt_modified']
                 book_in_db.wikipedia_url        = book['wikipedia_url']
                 book_in_db.reading_score        = book['reading_score']
                 book_in_db.reading_score_value  = book['reading_score_value']
-                book_in_db.related_books        = related_books_str
+                book_in_db.related_gt_books     = related_books_str
                 books_to_update.append(book_in_db)
             else:
                 books_to_create.append(Book(
@@ -256,10 +258,12 @@ def put_catalog_in_db(stat_cache, limit=None):
                     media_type=book['type'],
                     title=book['title'],
                     published_year=book['published_year'],
+                    issued_date=book['issued_date'],
+                    gt_modified=book['gt_modified'],
                     wikipedia_url=book['wikipedia_url'],
                     reading_score=book['reading_score'],
                     reading_score_value=book['reading_score_value'],
-                    related_books=related_books_str,
+                    related_gt_books=related_books_str,
                 ))
 
             book_records.append((directory, id, st, book, is_new))

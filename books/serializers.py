@@ -49,7 +49,7 @@ class BookSerializer(serializers.ModelSerializer):
     subjects = serializers.SerializerMethodField()
     summaries = serializers.SerializerMethodField()
     translators = PersonSerializer(many=True)
-    related_books = serializers.SerializerMethodField()
+    related_gt_books = serializers.SerializerMethodField()
 
     lookup_field = 'gutenberg_id'
 
@@ -69,7 +69,9 @@ class BookSerializer(serializers.ModelSerializer):
             'media_type',
             'formats',
             'download_count',
-            'related_books',
+            'related_gt_books',
+            'issued_date',
+            'gt_modified',
         )
 
     def get_bookshelves(self, book):
@@ -98,7 +100,7 @@ class BookSerializer(serializers.ModelSerializer):
         summaries.sort()
         return summaries
 
-    def get_related_books(self, book):
-        if not book.related_books:
+    def get_related_gt_books(self, book):
+        if not book.related_gt_books:
             return []
-        return [int(x) for x in book.related_books.split(',') if x.strip()]
+        return [int(x) for x in book.related_gt_books.split(',') if x.strip()]

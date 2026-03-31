@@ -1,5 +1,6 @@
 import defusedxml.ElementTree as parser
 import re
+from datetime import date
 
 
 LINE_BREAK_PATTERN = re.compile(r'[ \t]*[\n\r]+[ \t]*')
@@ -61,10 +62,12 @@ def get_book(id, xml_file_path):
         'bookshelves': [],
         'copyright': None,
         'published_year': None,
+        'issued_date': None,
+        'gt_modified': None,
         'wikipedia_url': '',
         'reading_score': '',
         'reading_score_value': None,
-        'related_books': [],
+        'related_gt_books': [],
     }
 
     # Authors
@@ -157,13 +160,26 @@ def get_book(id, xml_file_path):
     summaries = book.findall('.//{%(pg)s}marc520' % NAMESPACES)
     result['summaries'] = [summary.text for summary in summaries]
 
-    # Published year (dcterms:issued → YYYY-MM-DD → int year)
+    # Published year + full issued date (dcterms:issued → YYYY-MM-DD)
     issued = book.find('.//{%(dc)s}issued' % NAMESPACES)
     if issued is not None and issued.text:
         try:
             result['published_year'] = int(issued.text[:4])
+            result['issued_date'] = date.fromisoformat(issued.text)
         except (ValueError, TypeError):
             pass
+
+    # Modified date — dcterms:modified on the .rdf file entry
+    for file_el in book.findall('.//{%(pg)s}file' % NAMESPACES):
+        about = file_el.get('{%(rdf)s}about' % NAMESPACES, '')
+        if about.endswith('.rdf'):
+            mod_el = file_el.find('{%(dc)s}modified' % NAMESPACES)
+            if mod_el is not None and mod_el.text:
+                try:
+                    result['gt_modified'] = date.fromisoformat(mod_el.text[:10])
+                except ValueError:
+                    pass
+            break
 
     # Wikipedia URL (from dcterms:description)
     for desc in book.findall('.//{%(dc)s}description' % NAMESPACES):
@@ -181,7 +197,7 @@ def get_book(id, xml_file_path):
                 raw_id = int(m.group(1) or m.group(2) or m.group(3))
                 if raw_id != int(id):
                     seen_ids.add(raw_id)
-    result['related_books'] = sorted(seen_ids)
+    result['related_gt_books'] = sorted(seen_ids)
 
     # Reading ease (pgterms:marc908) — e.g. "Reading ease score: 78.7 (7th grade). Fairly easy to read."
     marc908_el = book.find('.//{%(pg)s}marc908' % NAMESPACES)
