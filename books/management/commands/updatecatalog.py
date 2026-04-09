@@ -43,7 +43,9 @@ def get_directory_set(path):
 
 def log(*args, force=False):
     now = strftime('%H:%M:%S')
-    text = now + '  ' + ' '.join(args)
+    message = ' '.join(args)
+    indent = '' if message.startswith("Starting '") else '    '
+    text = now + '  ' + indent + message
     if not _quiet_mode or force:
         print(text)
     if not os.path.exists(LOG_DIRECTORY):
@@ -697,6 +699,7 @@ class Command(BaseCommand):
 
         force = options['force_download']
         minimal_log = options['minimal_log']
+        quiet_bars = options.get('quiet_bars', False)
 
         try:
             date_and_time = strftime('%H:%M:%S on %B %d, %Y')
@@ -729,12 +732,12 @@ class Command(BaseCommand):
             if remote_lm:
                 log('  Remote Last-Modified: %s%s' % (remote_lm, ' (forced)' if force else ''))
             log('Downloading compressed catalog...')
-            _download_with_progress(URL, DOWNLOAD_PATH, quiet=minimal_log)
+            _download_with_progress(URL, DOWNLOAD_PATH, quiet=minimal_log or quiet_bars)
             if remote_lm:
                 _save_local_last_modified(remote_lm)
 
             log('Decompressing catalog...')
-            actual_dirs, size_mb = _decompress_with_progress(DOWNLOAD_PATH, TEMP_PATH, quiet=minimal_log)
+            actual_dirs, size_mb = _decompress_with_progress(DOWNLOAD_PATH, TEMP_PATH, quiet=minimal_log or quiet_bars)
             if minimal_log:
                 log('Archive downloaded and decompressed (%s dirs extracted, %s MB)' % (
                     f'{actual_dirs:,}', f'{size_mb:,.0f}'), force=True)
